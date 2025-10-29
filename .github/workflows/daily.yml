@@ -2,8 +2,8 @@ name: FlashTrade Leaderboard Snapshot
 
 on:
   schedule:
-    # 15:00 JST = 06:00 UTC
-    - cron: "0 6 * * *"
+    # 日本時間15:00 = UTC 06:00
+    - cron: '0 6 * * *'
   workflow_dispatch:
 
 jobs:
@@ -14,16 +14,13 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Node.js
+      - name: Setup Node.js (pin registry)
         uses: actions/setup-node@v4
         with:
           node-version: 20
 
-      - name: Install Playwright (Chromium)
-        run: |
-          npm init -y >/dev/null 2>&1 || true
-          npm i -D playwright@^1.48.0
-          npx playwright install --with-deps chromium
+      - name: Install Playwright (browser)
+        run: npx playwright install --with-deps chromium
 
       - name: Generate card image
         run: node snapshot.js
@@ -35,6 +32,5 @@ jobs:
           path: |
             leaderboard_card.png
             raw_page.png
+            debug/
             data/last.json
-            debug/**
-          if-no-files-found: warn
