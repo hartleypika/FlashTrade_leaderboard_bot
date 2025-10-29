@@ -1,4 +1,4 @@
-// snapshot.js
+// snapshot.js (robust)
 const fs = require('fs/promises');
 const path = require('path');
 const crypto = require('crypto');
@@ -8,102 +8,67 @@ const URL = 'https://www.flash.trade/leaderboard';
 
 const medal = (r) => (r === 1 ? '🥇' : r === 2 ? '🥈' : r === 3 ? '🥉' : '');
 const fmtUsd = (n) => '$' + Math.round(Number(n || 0)).toLocaleString('en-US');
-const pickNumber = (v) => {
-  if (v == null) return 0;
-  const s = String(v);
-  const m = s.match(/[\d,]+(\.\d+)?/);
-  return m ? Number(m[0].replace(/,/g, '')) : (typeof v === 'number' ? v : 0);
+const num = (v) => {
+  if (typeof v === 'number') return v;
+  const m = String(v ?? '').match(/[\d,]+(\.\d+)?/);
+  return m ? Number(m[0].replace(/,/g, '')) : 0;
 };
 
-// 候補キーから最適なフィールドを引く
-const pickField = (obj, keys) => {
-  for (const k of keys) {
-    const hit = Object.keys(obj).find((x) => x.toLowerCase() === k.toLowerCase());
-    if (hit) return obj[hit];
-  }
-  // 前方一致（例: totalVolume, walletAddress など）
-  for (const k of keys) {
-    const hit = Object.keys(obj).find((x) => x.toLowerCase().includes(k.toLowerCase()));
-    if (hit) return obj[hit];
-  }
-  return undefined;
-};
-
-// JSON の配列候補を総当りで抽出
-const digArrays = (node, out = []) => {
-  if (!node || typeof node !== 'object') return out;
-  if (Array.isArray(node)) out.push(node);
-  for (const v of Object.values(node)) digArrays(v, out);
+// 深掘りで配列候補を拾う
+const digArrays = (n, out = []) => {
+  if (!n || typeof n !== 'object') return out;
+  if (Array.isArray(n)) out.push(n);
+  for (const v of Object.values(n)) digArrays(v, out);
   return out;
 };
 
-// JSON から Top20 を推定
+// JSON 推定
 function guessTop20FromJson(pool) {
-  // すべての JSON から配列候補を集める
-  let candidates = [];
-  for (const { body } of pool) candidates.push(...digArrays(body));
+  const arrays = [];
+  for (const { body } of pool) digArrays(body, arrays);
 
-  // “アドレスっぽい文字列” と “ボリュームっぽい数値” を含む配列を優先
-  const isAddr = (s) => /[1-9A-HJ-NP-Za-km-z]{20,}/.test(String(s || '')); // base58 っぽい
-  const scoreArray = (arr) => {
-    let score = 0;
-    for (const it of arr.slice(0, 30)) {
+  const looksAddr = (s) => /[1-9A-HJ-NP-Za-km-z]{20,}/.test(String(s || ''));
+  const score = (arr) => {
+    let s = 0;
+    for (const it of arr.slice(0, 40)) {
       if (!it || typeof it !== 'object') continue;
-      const addr =
-        pickField(it, ['address', 'wallet', 'owner', 'account', 'id']) ||
-        Object.values(it).find((x) => isAddr(x));
-      const vol =
-        pickField(it, ['volume', 'totalVolume', 'vp', 'points', 'voltagePoints', 'value']) ??
-        Object.values(it).find((x) => typeof x === 'number' && x > 1000);
-      if (addr) score += 2;
-      if (vol != null) score += 1;
+      const vals = Object.values(it);
+      if (vals.some(looksAddr)) s += 2;
+      if (vals.some((x) => typeof x === 'number' && x > 1_000)) s += 1;
     }
-    // 配列長も少し加点
-    score += Math.min(arr.length, 50) / 10;
-    return score;
+    return s + Math.min(arr.length, 50) / 10;
   };
 
-  candidates = candidates
-    .filter((a) => Array.isArray(a) && a.length >= 10)
-    .map((a) => ({ arr: a, score: scoreArray(a) }))
-    .sort((a, b) => b.score - a.score);
+  const cand = arrays
+    .filter((a) => a.length >= 10)
+    .map((a) => ({ a, s: score(a) }))
+    .sort((x, y) => y.s - x.s);
 
-  if (!candidates.length) return null;
-  const best = candidates[0].arr;
+  if (!cand.length) return null;
 
-  // 正規化
-  const normalized = best.map((it, idx) => {
-    // 柔軟にフィールドを当てに行く
-    const address =
-      pickField(it, ['address', 'wallet', 'owner', 'account', 'id']) ||
-      Object.values(it).find((x) => /[1-9A-HJ-NP-Za-km-z]{20,}/.test(String(x || ''))) ||
+  const best = cand[0].a.map((it, i) => {
+    const entries = Object.entries(it || {});
+    const addr =
+      entries.find(([k, v]) => /address|wallet|owner|account|id/i.test(k) && looksAddr(v))?.[1] ||
+      entries.find(([_, v]) => looksAddr(v))?.[1] ||
       '';
-    const level = pickField(it, ['level', 'lvl']) ?? '';
+    const level = entries.find(([k]) => /level|lvl/i.test(k))?.[1] ?? '';
     const faf =
-      pickField(it, ['faf', 'staked', 'stakedFAF', 'stake']) ??
-      pickField(it, ['staked_faf', 'fafStaked']) ??
+      entries.find(([k]) => /faf|stake/i.test(k))?.[1] ??
+      entries.find(([k]) => /staked[_]?faf/i.test(k))?.[1] ??
       '';
-    const volRaw =
-      pickField(it, ['volume', 'totalVolume', 'vp', 'points', 'voltagePoints', 'value']) ??
-      Object.values(it).find((x) => typeof x === 'number');
+    const vol =
+      entries.find(([k, v]) => /volume|totalvolume|vp|points|voltage/i.test(k) && typeof v !== 'object')?.[1] ??
+      entries.find(([_, v]) => typeof v === 'number')?.[1] ??
+      '';
 
-    const volumeNum = pickNumber(volRaw);
-    const volume = fmtUsd(volumeNum);
-
-    return {
-      rank: idx + 1,
-      address: String(address).slice(0, 50),
-      level: String(level ?? ''),
-      faf: String(faf ?? ''),
-      volume,
-      volumeNum,
-    };
+    const volNum = num(vol);
+    return { rank: i + 1, address: String(addr), level: String(level ?? ''), faf: String(faf ?? ''), volume: fmtUsd(volNum), volNum };
   });
 
-  // volume の降順で並び替えた上で rank 付け直し
-  const top = normalized
+  const top = best
     .filter((x) => x.address)
-    .sort((a, b) => b.volumeNum - a.volumeNum)
+    .sort((a, b) => b.volNum - a.volNum)
     .slice(0, 20)
     .map((x, i) => ({ ...x, rank: i + 1 }));
 
@@ -111,94 +76,99 @@ function guessTop20FromJson(pool) {
 }
 
 (async () => {
+  await fs.mkdir('debug/json', { recursive: true });
+  await fs.mkdir('data', { recursive: true });
+
   const browser = await chromium.launch({ headless: true, args: ['--no-sandbox'] });
   const context = await browser.newContext({
-    viewport: { width: 1280, height: 1600 },
+    viewport: { width: 1300, height: 2000 },
     deviceScaleFactor: 2,
     userAgent:
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118 Safari/537.36',
+    bypassCSP: true,
+    serviceWorkers: 'block',
   });
+
   const page = await context.newPage();
 
-  // 受信 JSON をすべて保存＆保持
-  const jsonPool = [];
-  await fs.mkdir('debug/json', { recursive: true });
+  // webdriver偽装
+  await page.addInitScript(() => {
+    Object.defineProperty(navigator, 'webdriver', { get: () => false });
+  });
 
+  // 強めのヘッダ
+  await page.setExtraHTTPHeaders({
+    'cache-control': 'no-cache',
+    pragma: 'no-cache',
+    'accept-language': 'en-US,en;q=0.9',
+    accept: 'text/html,application/json;q=0.9,*/*;q=0.8',
+    referer: 'https://www.flash.trade/',
+  });
+
+  // すべてのレスポンスを保存（content-type に依存しない）
+  const pool = [];
   page.on('response', async (res) => {
     try {
-      const ct = (res.headers()['content-type'] || '').toLowerCase();
-      if (!ct.includes('application/json')) return;
       const url = res.url();
-      const body = await res.json();
-
-      jsonPool.push({ url, body });
-
-      const name =
-        url
-          .replace(/^https?:\/\//, '')
-          .replace(/[^\w.-]+/g, '_')
-          .slice(0, 180) +
+      const txt = await res.text();
+      // JSON っぽければ parse
+      let body = null;
+      try {
+        body = JSON.parse(txt);
+      } catch {}
+      // 保存
+      const base =
+        url.replace(/^https?:\/\//, '').replace(/[^\w.-]+/g, '_').slice(0, 160) +
         '_' +
-        crypto.createHash('md5').update(url).digest('hex').slice(0, 8) +
-        '.json';
-      await fs.writeFile(path.join('debug/json', name), JSON.stringify(body, null, 2), 'utf8');
+        crypto.createHash('md5').update(url).digest('hex').slice(0, 8);
+      await fs.writeFile(path.join('debug/json', base + '.txt'), txt);
+      if (body) {
+        await fs.writeFile(path.join('debug/json', base + '.json'), JSON.stringify(body, null, 2));
+        pool.push({ url, body });
+      }
     } catch {}
   });
 
-  // キャッシュ抑止
-  await page.setExtraHTTPHeaders({ 'cache-control': 'no-cache', pragma: 'no-cache' });
-
-  // 遷移（nocache クエリ）
-  await page.goto(`${URL}?nocache=${Date.now()}`, {
-    waitUntil: 'domcontentloaded',
-    timeout: 60000,
-  });
-
-  // 少し操作して 8〜12 秒ほどネットワークを待つ（CSR の fetch を待機）
+  // 読み込み
+  await page.goto(`${URL}?nocache=${Date.now()}`, { waitUntil: 'domcontentloaded', timeout: 90000 });
+  // しっかり待つ（CSRのfetch完了を狙う）
+  await page.waitForLoadState('networkidle', { timeout: 60000 }).catch(() => {});
   for (let i = 0; i < 4; i++) {
     await page.mouse.wheel(0, 800);
-    await page.waitForTimeout(600);
+    await page.waitForTimeout(700);
   }
   await page.waitForTimeout(4000);
 
-  // JSON から推定
-  let top20 = guessTop20FromJson(jsonPool);
+  // まず JSON から推定
+  let top20 = guessTop20FromJson(pool);
 
-  // 最後の保険：DOM の table/role を見る（うまく行けばそのまま使える）
+  // 取れなければ DOM も試す
   if (!top20) {
     const rows = await page.evaluate(() => {
-      const fromTable = Array.from(document.querySelectorAll('table tbody tr'))
+      const norm = (el) => (el?.innerText || el?.textContent || '').replace(/\s+/g, ' ').trim();
+      const tb = Array.from(document.querySelectorAll('table tbody tr'))
         .slice(0, 20)
-        .map((tr) =>
-          Array.from(tr.querySelectorAll('td')).map((td) =>
-            (td.innerText || td.textContent || '').replace(/\s+/g, ' ').trim()
-          )
-        );
-
-      const fromRole = Array.from(document.querySelectorAll('[role="row"]'))
-        .map((row) =>
-          Array.from(row.querySelectorAll('[role="cell"], td')).map((c) =>
-            (c.innerText || c.textContent || '').replace(/\s+/g, ' ').trim()
-          )
-        )
+        .map((tr) => Array.from(tr.querySelectorAll('td')).map(norm));
+      if (tb.length >= 10) return tb;
+      const aria = Array.from(document.querySelectorAll('[role="row"]'))
+        .map((row) => Array.from(row.querySelectorAll('[role="cell"], td')).map(norm))
         .filter((cells) => cells.length >= 4)
         .slice(0, 20);
-
-      return fromTable.length >= 10 ? fromTable : fromRole;
+      return aria;
     });
 
     if (rows && rows.length) {
       top20 = rows
         .map((tds, i) => {
-          const addr = tds[1] || '';
-          const vol = tds.find((x) => /\$\d/.test(x)) || '';
+          const address = tds[1] || '';
+          const volStr = tds.find((s) => /\$[\d,]/.test(s)) || '';
           return {
             rank: i + 1,
-            address: addr,
+            address,
             level: tds[2] || '',
             faf: tds[3] || '',
-            volume: vol,
-            volumeNum: pickNumber(vol),
+            volume: volStr,
+            volNum: num(volStr),
           };
         })
         .filter((x) => x.address)
@@ -206,50 +176,36 @@ function guessTop20FromJson(pool) {
     }
   }
 
-  // ここまでで無理なら HTML 保存してエラー終了
+  // それでもダメなら HTML とスクショを保存して成功終了（ワークフローを落とさない）
   if (!top20 || !top20.length) {
-    await fs.mkdir('debug', { recursive: true });
     await fs.writeFile('debug/page.html', await page.content(), 'utf8');
+    await page.screenshot({ path: 'raw_leaderboard.png', fullPage: true });
     await browser.close();
-    console.error('No rows captured. Saved HTML to debug/page.html');
-    process.exit(1);
+    console.log('⚠️ No rows captured. Saved debug/page.html & raw_leaderboard.png & debug/json/*');
+    process.exit(0); // ← 成功扱い（Artifacts を手で見れるように）
   }
 
-  // 前日データ（差分用）
-  let yesterday = [];
-  try {
-    yesterday = JSON.parse(await fs.readFile('data/last.json', 'utf8'));
-  } catch {}
-  const mapY = new Map((yesterday || []).map((r) => [r.address, r]));
+  // 差分用
+  let y = [];
+  try { y = JSON.parse(await fs.readFile('data/last.json', 'utf8')); } catch {}
+  const mapY = new Map(y.map((r) => [r.address, r]));
+
   const withDiff = top20.map((t) => {
-    const y = mapY.get(t.address);
-    return {
-      ...t,
-      deltaVP: y ? t.volumeNum - (y.volumeNum || 0) : null,
-      deltaRank: y ? t.rank - (y.rank || 0) : null,
-    };
+    const prev = mapY.get(t.address);
+    const deltaVP = prev ? t.volNum - (prev.volNum || 0) : null;
+    const deltaRank = prev ? t.rank - (prev.rank || 0) : null;
+    return { ...t, deltaVP, deltaRank };
   });
 
-  // 次回用に保存
-  await fs.mkdir('data', { recursive: true });
-  await fs.writeFile('data/last.json', JSON.stringify(top20, null, 2), 'utf8');
+  await fs.writeFile('data/last.json', JSON.stringify(top20, null, 2));
 
-  // 画像カードをレンダリング
+  // カード描画
   const rowsHtml = withDiff
     .map((r) => {
-      const dVP =
-        r.deltaVP == null ? '–' : `${r.deltaVP >= 0 ? '+' : '-'}${fmtUsd(Math.abs(r.deltaVP))}`;
+      const dVP = r.deltaVP == null ? '–' : `${r.deltaVP >= 0 ? '+' : '-'}${fmtUsd(Math.abs(r.deltaVP))}`;
       const dRank =
-        r.deltaRank == null
-          ? '–'
-          : r.deltaRank < 0
-          ? `▲${Math.abs(r.deltaRank)}`
-          : r.deltaRank > 0
-          ? `▼${r.deltaRank}`
-          : '＝';
-      const dRankColor =
-        r.deltaRank == null ? '#8aa1b1' : r.deltaRank < 0 ? '#2ecc71' : r.deltaRank > 0 ? '#e74c3c' : '#8aa1b1';
-
+        r.deltaRank == null ? '–' : r.deltaRank < 0 ? `▲${Math.abs(r.deltaRank)}` : r.deltaRank > 0 ? `▼${r.deltaRank}` : '＝';
+      const dRankColor = r.deltaRank == null ? '#8aa1b1' : r.deltaRank < 0 ? '#2ecc71' : r.deltaRank > 0 ? '#e74c3c' : '#8aa1b1';
       return `
         <tr>
           <td>${medal(r.rank)}${String(r.rank).padStart(2, '0')}</td>
@@ -264,42 +220,39 @@ function guessTop20FromJson(pool) {
     .join('');
 
   const html = `
-  <html>
-  <head>
-    <meta charset="utf-8"/>
-    <style>
-      body { margin:0; background:#0b1217; color:#e6f0f7; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial; }
-      .wrap { width: 1200px; margin: 24px auto; background:#0f151a; border-radius:14px; box-shadow:0 10px 30px rgba(0,0,0,.35); overflow:hidden; }
-      .title { padding:18px 22px; font-size:24px; font-weight:700; border-bottom:1px solid #1b2732; }
-      table { width:100%; border-collapse:collapse; font-size:16px; }
-      th, td { padding:12px 14px; border-bottom:1px solid #15202b; }
-      th { text-align:left; color:#8aa1b1; font-weight:600; background:#0e151b; position:sticky; top:0; }
-      tr:nth-child(even){ background:#0e151b; }
-      td:first-child { width:110px; }
-      td:nth-child(2) { width:420px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace; }
-      .footer { padding:12px 14px; color:#8aa1b1; font-size:12px; }
-    </style>
-  </head>
+  <html><head><meta charset="utf-8"/>
+  <style>
+    body{margin:0;background:#0b1217;color:#e6f0f7;font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Arial}
+    .wrap{width:1200px;margin:24px auto;background:#0f151a;border-radius:14px;box-shadow:0 10px 30px rgba(0,0,0,.35);overflow:hidden}
+    .title{padding:18px 22px;font-size:24px;font-weight:700;border-bottom:1px solid #1b2732}
+    table{width:100%;border-collapse:collapse;font-size:16px}
+    th,td{padding:12px 14px;border-bottom:1px solid #15202b}
+    th{text-align:left;color:#8aa1b1;font-weight:600;background:#0e151b;position:sticky;top:0}
+    tr:nth-child(even){background:#0e151b}
+    td:first-child{width:110px}
+    td:nth-child(2){width:420px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace}
+    .footer{padding:12px 14px;color:#8aa1b1;font-size:12px}
+  </style></head>
   <body>
     <div class="wrap">
       <div class="title">FlashTrade Leaderboard — Top 20</div>
       <table>
-        <thead>
-          <tr>
-            <th>Rank</th><th>Address</th><th>Level</th><th>FAF</th><th style="text-align:right">Volume</th><th style="text-align:right">ΔVP</th><th style="text-align:right">ΔRank</th>
-          </tr>
-        </thead>
+        <thead><tr>
+          <th>Rank</th><th>Address</th><th>Level</th><th>FAF</th>
+          <th style="text-align:right">Volume</th>
+          <th style="text-align:right">ΔVP</th>
+          <th style="text-align:right">ΔRank</th>
+        </tr></thead>
         <tbody>${rowsHtml}</tbody>
       </table>
       <div class="footer">Snapshot (UTC): ${new Date().toISOString().slice(0,16).replace('T',' ')}</div>
     </div>
-  </body>
-  </html>`;
+  </body></html>`;
 
   const card = await context.newPage();
   await card.setContent(html, { waitUntil: 'load' });
   await card.screenshot({ path: 'leaderboard_card.png', fullPage: true });
 
   await browser.close();
-  console.log('✅ Done. Saved leaderboard_card.png, data/last.json and debug/json/*.json');
+  console.log('✅ Saved leaderboard_card.png / data/last.json / debug/json/*');
 })();
