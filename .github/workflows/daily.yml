@@ -2,11 +2,9 @@ name: FlashTrade Leaderboard Snapshot
 
 on:
   schedule:
-    - cron: "0 6 * * *"   # 15:00 JST
+    # 15:00 JST = 06:00 UTC
+    - cron: "0 6 * * *"
   workflow_dispatch:
-
-permissions:
-  contents: write   # ← data/last.json をコミットするため
 
 jobs:
   snapshot:
@@ -15,46 +13,28 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: 20
 
-      - name: Pin npm registry
+      - name: Install Playwright (Chromium)
         run: |
-          npm config set registry https://registry.npmjs.org/
-          npm config set fund false
-          npm config set audit false
-
-      - name: Install dependencies (Playwright)
-        run: |
-          npm init -y
-          npm install --no-audit --no-fund playwright@^1.48.0
-
-      - name: Install Playwright browsers
-        run: npx playwright install --with-deps chromium
+          npm init -y >/dev/null 2>&1 || true
+          npm i -D playwright@^1.48.0
+          npx playwright install --with-deps chromium
 
       - name: Generate card image
         run: node snapshot.js
 
-      # data/last.json をコミット（次回の前日比較に使う）
-      - name: Commit daily data
-        run: |
-          if [ -n "$(git status --porcelain data/last.json)" ]; then
-            git config user.name  "gh-actions"
-            git config user.email "actions@github.com"
-            git add data/last.json
-            git commit -m "chore: update daily snapshot data"
-            git push
-          fi
-
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: leaderboard_card
+          name: leaderboard-assets
           path: |
             leaderboard_card.png
-            leaderboard_rows.json
+            raw_page.png
+            data/last.json
+            debug/**
+          if-no-files-found: warn
