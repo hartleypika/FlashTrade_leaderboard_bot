@@ -1,4 +1,4 @@
-// snapshot.js — FlashTrade Leaderboard: DOM安定版
+// snapshot.js — FlashTrade Leaderboard: robust DOM reader
 const fs = require('fs/promises');
 const path = require('path');
 const { chromium } = require('playwright');
@@ -11,10 +11,7 @@ const toUsd = (n) => {
   return '$' + Math.round(v).toLocaleString('en-US');
 };
 const num = (s) => Number(String(s).replace(/[^\d.-]/g, '')) || 0;
-const fixed = (s, w) => {
-  s = String(s ?? '');
-  return s.length <= w ? s : s.slice(0, w - 1) + '…';
-};
+const fixed = (s, w) => (String(s ?? '').length <= w ? String(s ?? '') : String(s ?? '').slice(0, w - 1) + '…');
 const medal = (r) => (r === 1 ? '🥇 ' : r === 2 ? '🥈 ' : r === 3 ? '🥉 ' : '');
 const timeStampUTC = () => new Date().toISOString().slice(0,16).replace('T',' ');
 
@@ -26,11 +23,11 @@ const timeStampUTC = () => new Date().toISOString().slice(0,16).replace('T',' ')
     args: ['--no-sandbox','--disable-dev-shm-usage','--disable-blink-features=AutomationControlled']
   });
   const ctx = await browser.newContext({
-    viewport: { width: 1440, height: 2100 },
+    viewport: { width: 1600, height: 2200 },      // 幅を広げて列を隠さない
     deviceScaleFactor: 2,
     timezoneId: 'UTC',
     locale: 'en-US',
-    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0 Safari/537.36'
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118 Safari/537.36'
   });
 
   // 軽いステルス
@@ -40,212 +37,126 @@ const timeStampUTC = () => new Date().toISOString().slice(0,16).replace('T',' ')
 
   const page = await ctx.newPage();
   await page.goto(URL + '?_' + Date.now(), { waitUntil: 'domcontentloaded', timeout: 60000 });
-
-  // しっかり描画させる（軽くスクロール & 待機）
   try { await page.waitForLoadState('networkidle', { timeout: 15000 }); } catch {}
-  for (let i = 0; i < 4; i++) { await page.mouse.wheel(0, 800); await sleep(400); }
-  await sleep(800);
 
-  // ❶ 見出し→列インデックスを確定
+  // 少しスクロールして描画を促す
+  for (let i=0;i<5;i++){ await page.mouse.wheel(0, 700); await sleep(250); }
+  await sleep(700);
+
+  // ヘッダ名→列インデックス
   const header = await page.evaluate(() => {
     const headRow =
       document.querySelector('table thead tr') ||
       document.querySelector('[role="table"] [role="rowgroup"] [role="row"]');
     if (!headRow) return null;
-    const cells = Array.from(headRow.querySelectorAll('th, [role="columnheader"], td'))
-                       .map(el => (el.innerText || el.textContent || '').trim());
-    const indexByName = {};
-    cells.forEach((label, idx) => {
+    const getText = el => (el.innerText || el.textContent || '').replace(/\s+/g,' ').trim();
+    const cells = Array.from(headRow.querySelectorAll('th,[role="columnheader"],td,div')).map(getText);
+    const idx = {};
+    cells.forEach((label, i) => {
       const L = label.toLowerCase();
-      if (L.includes('rank')) indexByName.rank = idx;
-      if (L.includes('address')) indexByName.address = idx;
-      if (L.includes('level')) indexByName.level = idx;
-      if (L === 'faf' || L.includes('faf')) indexByName.faf = idx;
-      if (L.includes('voltage') || L === 'vp' || L.includes('points')) indexByName.vp = idx;
-      if (L.includes('Δvp') || L.includes('dvp')) indexByName.deltaVp = idx;
-      if (L.includes('Δrank') || L.includes('drank')) indexByName.deltaRank = idx;
+      if (L.includes('rank')) idx.rank = i;
+      if (L.includes('address')) idx.address = i;
+      if (L.includes('level')) idx.level = i;
+      if (L === 'faf' || L.includes('faf')) idx.faf = i;
+      if (L.includes('voltage') || L === 'vp' || L.includes('points')) idx.vp = i;
+      if (L.includes('Δvp') || L.includes('dvp')) idx.deltaVp = i;
+      if (L.includes('Δrank') || L.includes('drank')) idx.deltaRank = i;
     });
-    return indexByName;
+    return idx;
   });
 
   if (!header || header.address === undefined) {
-    // 最低限の保険：表自体が見つからない場合でもスクショだけ残す
     await page.screenshot({ path: 'raw_page.png', fullPage: true });
-    throw new Error('Header not detected. The table structure may have changed.');
+    throw new Error('Header not detected. Table structure changed?');
   }
 
-  // ❷ 各行の「Visit Profile」リンク（/profile/<address>）から完全アドレスを取得し、同じ行のセル値を読む
+  // 行読み出し（リンクに依存しない）：tbody>tr か role=row を対象にヘッダ位置でセルを読む
   const rows = await page.evaluate((header) => {
-    const qAll = (sel, root = document) => Array.from(root.querySelectorAll(sel));
-    const profileLinks = qAll('a[href*="/profile/"]');
+    const qAll = (sel, root=document) => Array.from(root.querySelectorAll(sel));
+    const getText = el => (el.innerText || el.textContent || '').replace(/\s+/g,' ').trim();
 
-    // 各リンクの祖先にある「行」をとる（role=row → tr → 近いdiv行の順）
-    const getRowEl = (el) =>
-      el.closest('[role="row"]') ||
-      el.closest('tr') ||
-      el.closest('div');
-
-    // セルテキストを配列化
-    const getCells = (row) => {
-      const candidates = [
-        () => qAll('td, th, [role="cell"], [data-column]', row),
-        () => qAll(':scope > *', row),
-      ];
-      for (const fn of candidates) {
-        const list = fn().map(c => (c.innerText || c.textContent || '').replace(/\s+/g,' ').trim()).filter(Boolean);
-        if (list.length >= 4) return list;
-      }
-      // 最終手段：row全体テキストを粗く分割
-      return (row.innerText || row.textContent || '').split(/\r?\n/).map(s=>s.trim()).filter(Boolean);
-    };
-
-    const toIndex = (cells, idx, fallback = '') => {
-      if (idx === undefined) return fallback;
-      return cells[idx] ?? fallback;
-    };
-
-    const seen = new Set();
-    const out = [];
-
-    for (const a of profileLinks) {
-      const m = a.getAttribute('href')?.match(/\/profile\/([1-9A-HJ-NP-Za-km-z]+)/);
-      if (!m) continue;
-      const address = m[1];
-      if (seen.has(address)) continue; // 同一行の複数リンクを除外
-      seen.add(address);
-
-      const row = getRowEl(a);
-      if (!row) continue;
-
-      const cells = getCells(row);
-
-      const rank = toIndex(cells, header.rank, '');
-      const level = toIndex(cells, header.level, '');
-      const faf = toIndex(cells, header.faf, '');
-      const vp = toIndex(cells, header.vp, '');
-      const deltaVp = toIndex(cells, header.deltaVp, '–');
-      const deltaRank = toIndex(cells, header.deltaRank, '–');
-
-      out.push({
-        address,
-        rank: Number(String(rank).replace(/[^\d]/g,'')) || null,
-        level,
-        faf,
-        vp,
-        deltaVp,
-        deltaRank
-      });
+    // データ行候補
+    let dataRows = qAll('table tbody tr');
+    if (dataRows.length < 10) {
+      const allRows = qAll('[role="table"] [role="rowgroup"] [role="row"]');
+      // 先頭（ヘッダ）を除外
+      dataRows = allRows.slice(1);
     }
 
-    // rankが取れている行を優先し、なければリンク出現順
-    out.sort((a,b) => {
+    const list = [];
+    for (const row of dataRows) {
+      const cells = Array.from(row.querySelectorAll('td, [role="cell"], div')).map(getText).filter(Boolean);
+      if (cells.length < 4) continue;
+
+      const pick = (i, d='') => (i===undefined ? d : (cells[i] ?? d));
+
+      // 省略表示のアドレス（4ky4Tk…sH4z 等）もそのまま採用
+      const address = pick(header.address, '');
+      if (!address) continue;
+
+      const r = {
+        rank: Number(String(pick(header.rank,'')).replace(/[^\d]/g,'')) || null,
+        address,
+        level: pick(header.level,''),
+        faf: pick(header.faf,''),
+        vp: pick(header.vp,''),
+        deltaVp: pick(header.deltaVp,'–'),
+        deltaRank: pick(header.deltaRank,'–')
+      };
+      list.push(r);
+    }
+
+    // rankがあればソート
+    list.sort((a,b) => {
       if (a.rank && b.rank) return a.rank - b.rank;
-      if (a.rank) return -1;
-      if (b.rank) return 1;
-      return 0;
+      if (a.rank) return -1; if (b.rank) return 1; return 0;
     });
-    return out;
+
+    return list.slice(0, 30);
   }, header);
 
-  // 総数チェック（少なければ再描画＆再取得）
-  let top = rows;
-  if (!top || top.length < 10) {
-    // 少し上に戻って再描画してからもう一度拾う
-    for (let i=0;i<4;i++){ await page.mouse.wheel(0,-800); await sleep(250); }
-    for (let i=0;i<6;i++){ await page.mouse.wheel(0, 600); await sleep(250); }
-
-    // 再評価（同ロジック）
-    const retry = await page.evaluate((header) => {
-      const qAll = (sel, root = document) => Array.from(root.querySelectorAll(sel));
-      const profileLinks = qAll('a[href*="/profile/"]');
-      const getRowEl = (el) => el.closest('[role="row"]') || el.closest('tr') || el.closest('div');
-      const getCells = (row) => {
-        const list = Array.from(row.querySelectorAll('td, th, [role="cell"], [data-column]'))
-          .map(c => (c.innerText || c.textContent || '').replace(/\s+/g,' ').trim()).filter(Boolean);
-        return list.length ? list : (row.innerText || row.textContent || '').split(/\r?\n/).map(s=>s.trim()).filter(Boolean);
-      };
-      const toIndex = (cells, idx, fallback='') => (idx===undefined ? fallback : (cells[idx] ?? fallback));
-      const seen = new Set();
-      const out = [];
-      for (const a of profileLinks) {
-        const m = a.getAttribute('href')?.match(/\/profile\/([1-9A-HJ-NP-Za-km-z]+)/);
-        if (!m) continue;
-        const address = m[1];
-        if (seen.has(address)) continue;
-        seen.add(address);
-        const row = getRowEl(a);
-        if (!row) continue;
-        const cells = getCells(row);
-        const rank = toIndex(cells, header.rank, '');
-        const level = toIndex(cells, header.level, '');
-        const faf = toIndex(cells, header.faf, '');
-        const vp = toIndex(cells, header.vp, '');
-        const deltaVp = toIndex(cells, header.deltaVp, '–');
-        const deltaRank = toIndex(cells, header.deltaRank, '–');
-        out.push({
-          address,
-          rank: Number(String(rank).replace(/[^\d]/g,'')) || null,
-          level, faf, vp, deltaVp, deltaRank
-        });
-      }
-      out.sort((a,b) => (a.rank && b.rank) ? a.rank - b.rank : a.rank ? -1 : b.rank ? 1 : 0);
-      return out;
-    }, header);
-    top = retry;
-  }
-
-  // 右上の「Total Volume Traded (Today)」
+  // 右上の “Total Volume Traded (Today)”
   const totalToday = await page.evaluate(() => {
-    const txt = document.body.innerText || '';
-    const m = txt.match(/Total\s+Volume\s+Traded\s+\(Today\)\s*:\s*\$[\d,]+/i);
+    const t = document.body.innerText || '';
+    const m = t.match(/Total\s+Volume\s+Traded\s+\(Today\)\s*:\s*\$[\d,]+/i);
     if (!m) return null;
     const m2 = m[0].match(/\$[\d,]+/);
     return m2 ? m2[0] : null;
   });
 
-  // スクショ（デバッグ用）
   await page.screenshot({ path: 'raw_page.png', fullPage: true });
 
-  // 画像用データ成形
-  const normalized = (top || [])
-    .filter(r => r.address)
-    .slice(0, 20)
-    .map((r, i) => ({
+  // 画像用に整形
+  const top20 = (rows || []).filter(r => r.address).slice(0,20)
+    .map((r,i) => ({
       rank: r.rank ?? (i+1),
       address: r.address,
-      level: r.level?.replace(/\s+/g,' ').trim() || '',
-      faf: r.faf?.replace(/\s+/g,' ').trim() || '',
+      level: r.level?.trim() || '',
+      faf: r.faf?.trim() || '',
       volume: r.vp || '',
       dVP: r.deltaVp || '–',
       dRank: r.deltaRank || '–'
     }));
 
-  // 差分用の last.json 更新（任意：volume 数値化を保存）
+  // last.json（差分用・任意）
   try {
-    const snapshotForDiff = normalized.map(x => ({
-      rank: x.rank, address: x.address,
-      level: x.level, faf: x.faf,
-      volumeNum: num(x.volume)
-    }));
-    await fs.writeFile(path.join('data','last.json'), JSON.stringify(snapshotForDiff, null, 2));
+    const snapshot = top20.map(x => ({ rank:x.rank, address:x.address, level:x.level, faf:x.faf, volumeNum: num(x.volume) }));
+    await fs.writeFile(path.join('data','last.json'), JSON.stringify(snapshot, null, 2));
   } catch {}
 
-  // ❸ カード描画（列幅固定で重なり防止）
-  const rowsHtml = (normalized.length ? normalized : new Array(20).fill(null))
-    .map((r, idx) => {
-      if (!r) {
-        return `<tr><td>${String(idx+1).padStart(2,'0')}</td><td></td><td></td><td></td><td class="num">–</td><td class="num">–</td><td class="num">–</td></tr>`;
-      }
-      return `<tr>
-        <td>${medal(r.rank)}${String(r.rank).padStart(2,'0')}</td>
-        <td title="${r.address}">${fixed(r.address, 44)}</td>
-        <td title="${r.level}">${fixed(r.level, 14)}</td>
-        <td title="${r.faf}">${fixed(r.faf, 16)}</td>
-        <td class="num" title="${r.volume}">${r.volume || '–'}</td>
-        <td class="num" title="${r.dVP}">${r.dVP}</td>
-        <td class="num" title="${r.dRank}">${r.dRank}</td>
-      </tr>`;
-    }).join('\n');
+  // カード描画（列幅固定で重なり防止）
+  const rowsHtml = (top20.length ? top20 : new Array(20).fill(null)).map((r,idx) => {
+    if (!r) return `<tr><td>${String(idx+1).padStart(2,'0')}</td><td></td><td></td><td></td><td class="num">–</td><td class="num">–</td><td class="num">–</td></tr>`;
+    return `<tr>
+      <td>${medal(r.rank)}${String(r.rank).padStart(2,'0')}</td>
+      <td title="${r.address}">${fixed(r.address, 44)}</td>
+      <td title="${r.level}">${fixed(r.level, 14)}</td>
+      <td title="${r.faf}">${fixed(r.faf, 16)}</td>
+      <td class="num" title="${r.volume}">${r.volume || '–'}</td>
+      <td class="num" title="${r.dVP}">${r.dVP}</td>
+      <td class="num" title="${r.dRank}">${r.dRank}</td>
+    </tr>`;
+  }).join('\n');
 
   const html = `<!doctype html><html><head><meta charset="utf-8"/>
   <style>
