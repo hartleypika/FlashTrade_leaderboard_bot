@@ -1,12 +1,8 @@
 {
-  "name": "flashtrade_leaderboard_bot",
-  "version": "1.0.0",
+  "name": "flashtrade-leaderboard-bot",
   "private": true,
   "type": "commonjs",
-  "scripts": {
-    "start": "node snapshot.js"
-  },
-  "dependencies": {
-    "playwright": "^1.48.2"
+  "devDependencies": {
+    "playwright": "^1.48.0"
   }
 }
