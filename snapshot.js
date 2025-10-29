@@ -1,4 +1,4 @@
-// snapshot.js
+// snapshot.js ー anti-bot対策 + 強化待機 + 3段抽出(JSON→DOM→TEXT) + 差分 + カード描画
 const fs = require('fs/promises');
 const path = require('path');
 const crypto = require('crypto');
@@ -6,7 +6,7 @@ const { chromium } = require('playwright');
 
 const URL = 'https://www.flash.trade/leaderboard';
 
-// ---------- 小道具 ----------
+// ----------------- utils -----------------
 const medal = (r) => (r === 1 ? '🥇 ' : r === 2 ? '🥈 ' : r === 3 ? '🥉 ' : '');
 const toUsd = (n) => '$' + Math.round(Math.max(0, Number(n || 0))).toLocaleString('en-US');
 const num = (v) => {
@@ -15,20 +15,21 @@ const num = (v) => {
   const m = String(v).match(/[\d,]+(\.\d+)?/);
   return m ? Number(m[0].replace(/,/g, '')) : 0;
 };
-const timeStampUTC = () =>
-  new Date().toISOString().slice(0, 16).replace('T', ' ');
-
-// ベース58っぽい（Sol のアドレス等）
+const timeStampUTC = () => new Date().toISOString().slice(0, 16).replace('T', ' ');
 const looksLikeAddress = (s) => /[1-9A-HJ-NP-Za-km-z]{20,}/.test(String(s || ''));
 
-// ---------- JSON候補の探索 ----------
+function fixedWidth(str, max) {
+  str = String(str ?? '');
+  return str.length <= max ? str : str.slice(0, max - 1) + '…';
+}
+
+// JSON探索ヘルパ
 function collectArrays(node, out = []) {
   if (!node || typeof node !== 'object') return out;
   if (Array.isArray(node)) out.push(node);
   for (const v of Object.values(node)) collectArrays(v, out);
   return out;
 }
-
 function pickField(obj, preferred) {
   const keys = Object.keys(obj);
   for (const k of preferred) {
@@ -41,12 +42,10 @@ function pickField(obj, preferred) {
   }
   return undefined;
 }
-
 function guessTop20FromJson(jsonPool) {
   let arrays = [];
   for (const { body } of jsonPool) collectArrays(body, arrays);
   arrays = arrays.filter((a) => Array.isArray(a) && a.length >= 10);
-
   if (!arrays.length) return null;
 
   const score = (arr) => {
@@ -97,13 +96,10 @@ function guessTop20FromJson(jsonPool) {
   rows.sort((a, b) => b.volumeNum - a.volumeNum);
   return rows.slice(0, 20).map((x, i) => ({ ...x, rank: i + 1, volume: toUsd(x.volumeNum) }));
 }
-
 function guessTotalFromJson(jsonPool) {
-  // 合計に見えるフィールド、または配列の合計などを推定
   const candidates = [];
   for (const { body } of jsonPool) {
     if (!body || typeof body !== 'object') continue;
-    // 直接 totalVolume / dailyVolume を探す
     const keys = Object.keys(body);
     for (const k of keys) {
       if (/total.*volume|daily.*volume|volume.*today/i.test(k)) {
@@ -111,7 +107,6 @@ function guessTotalFromJson(jsonPool) {
         if (typeof v === 'number') candidates.push(v);
       }
     }
-    // 配列の合計（volumeNum的な数値を合計）
     const arrays = collectArrays(body);
     for (const arr of arrays) {
       const sum = arr
@@ -127,26 +122,51 @@ function guessTotalFromJson(jsonPool) {
     }
   }
   if (!candidates.length) return null;
-  // 一番大きい値を採用（だいたい合計が最大）
   return Math.max(...candidates);
 }
 
-// ---------- メイン ----------
+// ----------------- main -----------------
 (async () => {
-  const browser = await chromium.launch({ headless: true, args: ['--no-sandbox'] });
-  const context = await browser.newContext({
-    viewport: { width: 1280, height: 1800 },
-    deviceScaleFactor: 2,
-    userAgent:
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118 Safari/537.36'
-  });
-  const page = await context.newPage();
-
-  // デバッグ保存先
   await fs.mkdir('debug/json', { recursive: true });
   await fs.mkdir('data', { recursive: true });
 
-  // 受信JSONをキャプチャ
+  const browser = await chromium.launch({
+    headless: true,
+    args: [
+      '--no-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-blink-features=AutomationControlled',
+    ],
+  });
+
+  const context = await browser.newContext({
+    viewport: { width: 1366, height: 2200 },
+    deviceScaleFactor: 2,
+    timezoneId: 'UTC',
+    locale: 'en-US',
+    userAgent:
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.5993.90 Safari/537.36',
+  });
+
+  // できる限りbot判定を回避
+  await context.addInitScript(() => {
+    Object.defineProperty(navigator, 'webdriver', { get: () => false });
+    Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+    Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
+    Object.defineProperty(navigator, 'plugins', {
+      get: () => [{ name: 'Chrome PDF Plugin' }, { name: 'Chrome PDF Viewer' }],
+    });
+    const getParameter = WebGLRenderingContext.prototype.getParameter;
+    WebGLRenderingContext.prototype.getParameter = function (parameter) {
+      if (parameter === 37445) return 'Intel Inc.';          // UNMASKED_VENDOR_WEBGL
+      if (parameter === 37446) return 'Intel Iris OpenGL';   // UNMASKED_RENDERER_WEBGL
+      return getParameter.apply(this, [parameter]);
+    };
+  });
+
+  const page = await context.newPage();
+
+  // JSON横取り
   const jsonPool = [];
   page.on('response', async (res) => {
     try {
@@ -155,32 +175,118 @@ function guessTotalFromJson(jsonPool) {
       const url = res.url();
       const body = await res.json();
       jsonPool.push({ url, body });
-
       const name =
-        url.replace(/^https?:\/\//, '').replace(/[^\w.-]+/g, '_').slice(0, 180) +
-        '_' + crypto.createHash('md5').update(url).digest('hex').slice(0, 8) +
-        '.json';
+        url.replace(/^https?:\/\//, '').replace(/[^\w.-]+/g, '_').slice(0, 160) +
+        '_' + crypto.createHash('md5').update(url).digest('hex').slice(0, 8) + '.json';
       await fs.writeFile(path.join('debug/json', name), JSON.stringify(body, null, 2), 'utf8');
     } catch {}
   });
 
-  // キャッシュ抑止
-  await page.setExtraHTTPHeaders({ 'cache-control': 'no-cache', pragma: 'no-cache' });
+  // --------- ナビゲーション（強化待機＋リトライ） ---------
+  let loaded = false;
+  for (let attempt = 1; attempt <= 4; attempt++) {
+    await page.goto(`${URL}?_=${Date.now()}_${attempt}`, {
+      waitUntil: 'domcontentloaded',
+      timeout: 60000,
+    });
 
-  // 遷移
-  await page.goto(`${URL}?nocache=${Date.now()}`, { waitUntil: 'domcontentloaded', timeout: 60000 });
-  // しばらく待つ＋スクロールでCSRのfetchを促す
-  for (let i = 0; i < 5; i++) {
-    await page.mouse.wheel(0, 800);
-    await page.waitForTimeout(700);
+    // ネットワーク静穏 & スクロール & 人間っぽい操作
+    try { await page.waitForLoadState('networkidle', { timeout: 15000 }); } catch {}
+    for (let i = 0; i < 6; i++) {
+      await page.mouse.wheel(0, 800);
+      await page.waitForTimeout(700);
+    }
+    await page.mouse.move(200, 200);
+    await page.waitForTimeout(1000);
+
+    // 本文にアドレスが10件以上出たら「描画された」とみなす
+    const ok = await page.evaluate(() => {
+      const text = document.body.innerText;
+      const m = text.match(/[1-9A-HJ-NP-Za-km-z]{20,}/g);
+      return m && m.length >= 10;
+    }).catch(() => false);
+
+    if (ok) { loaded = true; break; }
+    // リロードして再試行
+    await page.waitForTimeout(2000);
   }
-  await page.waitForTimeout(3000);
 
-  // JSON優先で抽出
+  // 保険のスクショ
+  await page.screenshot({ path: 'raw_page.png', fullPage: true }).catch(()=>{});
+
+  // --------- ① JSON → ② DOM → ③ TEXT の順で抽出 ---------
   let top20 = guessTop20FromJson(jsonPool);
   let totalNum = guessTotalFromJson(jsonPool);
 
-  // DOMフォールバック（トップのTotal Volumeと行）
+  // ② DOM 抽出
+  if (!top20 || !top20.length) {
+    try {
+      const rows = await page.evaluate(() => {
+        const q = (sel, root = document) => Array.from(root.querySelectorAll(sel));
+        const fromTable = q('table tbody tr')
+          .map((tr) => q('td', tr).map((td) => (td.innerText || td.textContent || '').trim()))
+          .filter((a) => a.length >= 4);
+        if (fromTable.length >= 10) return fromTable.slice(0, 30);
+
+        const fromRole = q('[role="row"]')
+          .map((row) =>
+            q('[role="cell"], td, div', row)
+              .map((c) => (c.innerText || c.textContent || '').replace(/\s+/g, ' ').trim())
+              .filter(Boolean)
+          )
+          .filter((a) => a.length >= 4);
+        return fromRole.slice(0, 30);
+      });
+
+      if (rows && rows.length) {
+        const parsed = rows
+          .map((tds) => {
+            const address =
+              tds.find((s) => /[1-9A-HJ-NP-Za-km-z]{20,}/.test(s)) || tds[1] || '';
+            const volText = tds.find((s) => /\$\s?\d/.test(s)) || '';
+            const volumeNum = num(volText);
+            const level = tds.find((s) => /LVL|LV|Level/i.test(s)) || tds[2] || '';
+            const faf = tds.find((s) => /FAF|staked/i.test(s)) || tds[3] || '';
+            return { address, level, faf, volumeNum };
+          })
+          .filter((x) => x.address);
+
+        parsed.sort((a, b) => b.volumeNum - a.volumeNum);
+        top20 = parsed.slice(0, 20).map((x, i) => ({ ...x, rank: i + 1, volume: toUsd(x.volumeNum) }));
+      }
+    } catch {}
+  }
+
+  // ③ ページ全文テキストからのヒューリスティック抽出（最終手段）
+  if (!top20 || !top20.length) {
+    try {
+      const text = await page.evaluate(() => document.body.innerText);
+      const lines = text.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+
+      const addrIdx = [];
+      lines.forEach((s, i) => { if (/[1-9A-HJ-NP-Za-km-z]{20,}/.test(s)) addrIdx.push(i); });
+
+      const rows = addrIdx.slice(0, 30).map((i) => {
+        const address = lines[i];
+        const neighborhood = lines.slice(Math.max(0, i - 4), i + 6);
+        const volLine = neighborhood.find((s) => /\$\s?\d/.test(s)) || '';
+        const level = neighborhood.find((s) => /LVL|LV|Level/i.test(s)) || '';
+        const faf = neighborhood.find((s) => /FAF|staked/i.test(s)) || '';
+        const volumeNum = num(volLine);
+        return { address, level, faf, volumeNum };
+      }).filter((r) => r.address);
+
+      rows.sort((a, b) => b.volumeNum - a.volumeNum);
+      top20 = rows.slice(0, 20).map((x, i) => ({ ...x, rank: i + 1, volume: toUsd(x.volumeNum) }));
+    } catch {}
+  }
+
+  // うまくいかない場合でも HTML 保存
+  if (!top20 || !top20.length) {
+    try { await fs.writeFile('debug/page.html', await page.content(), 'utf8'); } catch {}
+  }
+
+  // Total Volume（DOMテキストからの保険）
   if (totalNum == null) {
     try {
       const allText = await page.evaluate(() => document.body.innerText);
@@ -192,53 +298,10 @@ function guessTotalFromJson(jsonPool) {
     } catch {}
   }
 
-  if (!top20 || !top20.length) {
-    try {
-      const rows = await page.evaluate(() => {
-        const q = (sel) => Array.from(document.querySelectorAll(sel));
-        const fromTable = q('table tbody tr')
-          .slice(0, 20)
-          .map((tr) => q('td', tr).map((td) => (td.innerText || td.textContent || '').trim()));
-        if (fromTable.length >= 10) return fromTable;
-
-        const fromRole = q('[role="row"]')
-          .map((row) =>
-            q('[role="cell"], td', row).map((c) => (c.innerText || c.textContent || '').trim())
-          )
-          .filter((a) => a.length >= 4)
-          .slice(0, 20);
-        return fromRole;
-      });
-
-      if (rows && rows.length) {
-        top20 = rows.map((tds, i) => {
-          const address = tds[1] || '';
-          const level = tds[2] || '';
-          const faf = tds[3] || '';
-          const volText = tds.find((x) => /\$\d/.test(x)) || '';
-          const volumeNum = num(volText);
-          return { rank: i + 1, address, level, faf, volumeNum, volume: toUsd(volumeNum) };
-        });
-      }
-    } catch {}
-  }
-
-  // 最後の保険：ページのHTML保存（調査用）
-  if (!top20 || !top20.length) {
-    await fs.writeFile('debug/page.html', await page.content(), 'utf8');
-  }
-
-  // 元ページのスクショ（保険）
-  await page.screenshot({ path: 'raw_page.png', fullPage: true });
-
-  // 前日データの読み込み
+  // 前日データから差分
   let yesterday = [];
-  try {
-    yesterday = JSON.parse(await fs.readFile('data/last.json', 'utf8'));
-  } catch {}
+  try { yesterday = JSON.parse(await fs.readFile('data/last.json', 'utf8')); } catch {}
   const mapY = new Map((yesterday || []).map((r) => [r.address, r]));
-
-  // 差分付与
   const withDiff = (top20 || []).map((r, i) => {
     const y = mapY.get(r.address);
     const rank = i + 1;
@@ -247,33 +310,36 @@ function guessTotalFromJson(jsonPool) {
       rank,
       volume: r.volume ?? toUsd(r.volumeNum),
       deltaVP: y ? r.volumeNum - (y.volumeNum || 0) : null,
-      deltaRank: y ? rank - (y.rank || 0) : null
+      deltaRank: y ? rank - (y.rank || 0) : null,
     };
   });
 
-  // 次回比較用に保存（データが拾えた時のみ）
   if (withDiff.length) {
-    await fs.writeFile('data/last.json', JSON.stringify(withDiff.map(({ deltaVP, deltaRank, ...rest }) => rest), null, 2));
+    await fs.writeFile(
+      'data/last.json',
+      JSON.stringify(withDiff.map(({ deltaVP, deltaRank, ...rest }) => rest), null, 2)
+    );
   }
 
-  // --------- カードHTML生成（文字重なり防止レイアウト） ----------
+  // --------- カード描画（固定列幅で重なり防止） ---------
   const totalStr = totalNum != null ? toUsd(totalNum) : '—';
 
   const rowsHtml = (withDiff.length ? withDiff : new Array(20).fill(null))
     .slice(0, 20)
     .map((r, idx) => {
       if (!r) {
-        return `<tr><td>${String(idx + 1).padStart(2, '0')}</td><td></td><td></td><td></td><td style="text-align:right"></td><td style="text-align:right">–</td><td style="text-align:right">–</td></tr>`;
+        return `<tr><td>${String(idx + 1).padStart(2, '0')}</td><td></td><td></td><td></td><td style="text-align:right">-</td><td style="text-align:right">-</td><td style="text-align:right">-</td></tr>`;
       }
       const dVP = r.deltaVP == null ? '–' : `${r.deltaVP >= 0 ? '+' : '-'}${toUsd(Math.abs(r.deltaVP))}`;
       const dr = r.deltaRank == null ? '–' : (r.deltaRank < 0 ? `▲${Math.abs(r.deltaRank)}` : r.deltaRank > 0 ? `▼${r.deltaRank}` : '＝');
       const drColor = r.deltaRank == null ? '#8aa1b1' : r.deltaRank < 0 ? '#2ecc71' : r.deltaRank > 0 ? '#e74c3c' : '#8aa1b1';
+
       return `
         <tr>
           <td>${medal(r.rank)}${String(r.rank).padStart(2, '0')}</td>
-          <td title="${r.address}">${r.address}</td>
-          <td title="${r.level ?? ''}">${r.level ?? ''}</td>
-          <td title="${r.faf ?? ''}">${r.faf ?? ''}</td>
+          <td title="${r.address}">${fixedWidth(r.address, 48)}</td>
+          <td title="${r.level ?? ''}">${fixedWidth(r.level ?? '', 10)}</td>
+          <td title="${r.faf ?? ''}">${fixedWidth(r.faf ?? '', 14)}</td>
           <td style="text-align:right">${r.volume}</td>
           <td style="text-align:right">${dVP}</td>
           <td style="text-align:right;color:${drColor}">${dr}</td>
@@ -282,60 +348,48 @@ function guessTotalFromJson(jsonPool) {
     .join('');
 
   const html = `
-  <html>
-    <head>
-      <meta charset="utf-8"/>
-      <style>
-        :root{
-          --bg:#0b1217; --panel:#0f151a; --line:#15202b; --muted:#8aa1b1; --text:#e6f0f7;
-        }
-        *{ box-sizing:border-box; }
-        body{ margin:0; background:var(--bg); color:var(--text); font: 16px/1.45 ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial; }
-        .wrap{ width:1200px; margin:24px auto; background:var(--panel); border-radius:14px; box-shadow:0 10px 30px rgba(0,0,0,.35); overflow:hidden; }
-        .head{ padding:18px 22px; border-bottom:1px solid var(--line); display:flex; align-items:baseline; gap:16px; }
-        .title{ font-size:24px; font-weight:700; }
-        .total{ margin-left:auto; font-weight:700; }
-        .total small{ color:var(--muted); font-weight:500; margin-right:10px; }
-        table{ width:100%; border-collapse:collapse; table-layout:fixed; }
-        th,td{ padding:12px 14px; border-bottom:1px solid var(--line); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-        th{ text-align:left; background:#0e151b; color:var(--muted); font-weight:600; }
-        tr:nth-child(even){ background:#0e151b; }
-        /* 列幅固定：重なり防止 */
-        th:nth-child(1),td:nth-child(1){ width:120px; }
-        th:nth-child(2),td:nth-child(2){ width:420px; font-family: ui-monospace,SFMono-Regular,Consolas,Menlo,monospace; }
-        th:nth-child(3),td:nth-child(3){ width:110px; }
-        th:nth-child(4),td:nth-child(4){ width:160px; }
-        th:nth-child(5),td:nth-child(5){ width:170px; }
-        th:nth-child(6),td:nth-child(6){ width:160px; }
-        th:nth-child(7),td:nth-child(7){ width:110px; }
-        td:nth-child(5), td:nth-child(6), td:nth-child(7){ text-align:right; }
-        .foot{ padding:10px 14px; color:var(--muted); font-size:12px; }
-      </style>
-    </head>
-    <body>
-      <div class="wrap">
-        <div class="head">
-          <div class="title">FlashTrade Leaderboard — Top 20</div>
-          <div class="total"><small>Total Volume Traded (Today):</small>${totalStr}</div>
-        </div>
-        <table>
-          <thead>
-            <tr>
-              <th>Rank</th><th>Address</th><th>Level</th><th>FAF</th><th>Volume</th><th>ΔVP</th><th>ΔRank</th>
-            </tr>
-          </thead>
-          <tbody>${rowsHtml}</tbody>
-        </table>
-        <div class="foot">Snapshot (UTC) ${timeStampUTC()} ・ Source: flash.trade/leaderboard</div>
-      </div>
-    </body>
-  </html>`;
+  <html><head><meta charset="utf-8"/>
+  <style>
+    :root{--bg:#0b1217;--panel:#0f151a;--line:#15202b;--muted:#8aa1b1;--text:#e6f0f7;}
+    *{box-sizing:border-box}
+    body{margin:0;background:var(--bg);color:var(--text);font:16px/1.45 ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Arial}
+    .wrap{width:1200px;margin:24px auto;background:var(--panel);border-radius:14px;box-shadow:0 10px 30px rgba(0,0,0,.35);overflow:hidden}
+    .head{padding:18px 22px;border-bottom:1px solid var(--line);display:flex;align-items:baseline;gap:16px}
+    .title{font-size:24px;font-weight:700}
+    .total{margin-left:auto;font-weight:700}
+    .total small{color:var(--muted);font-weight:500;margin-right:10px}
+    table{width:100%;border-collapse:collapse;table-layout:fixed}
+    th,td{padding:12px 14px;border-bottom:1px solid var(--line);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    th{text-align:left;background:#0e151b;color:var(--muted);font-weight:600}
+    tr:nth-child(even){background:#0e151b}
+    th:nth-child(1),td:nth-child(1){width:120px}
+    th:nth-child(2),td:nth-child(2){width:420px;font-family:ui-monospace,SFMono-Regular,Consolas,Menlo,monospace}
+    th:nth-child(3),td:nth-child(3){width:110px}
+    th:nth-child(4),td:nth-child(4){width:160px}
+    th:nth-child(5),td:nth-child(5){width:170px;text-align:right}
+    th:nth-child(6),td:nth-child(6){width:160px;text-align:right}
+    th:nth-child(7),td:nth-child(7){width:110px;text-align:right}
+    .foot{padding:10px 14px;color:var(--muted);font-size:12px}
+  </style></head>
+  <body><div class="wrap">
+    <div class="head">
+      <div class="title">FlashTrade Leaderboard — Top 20</div>
+      <div class="total"><small>Total Volume Traded (Today):</small>${totalStr}</div>
+    </div>
+    <table>
+      <thead><tr>
+        <th>Rank</th><th>Address</th><th>Level</th><th>FAF</th><th>Volume</th><th>ΔVP</th><th>ΔRank</th>
+      </tr></thead>
+      <tbody>${rowsHtml}</tbody>
+    </table>
+    <div class="foot">Snapshot (UTC) ${timeStampUTC()} ・ Source: flash.trade/leaderboard</div>
+  </div></body></html>`;
 
-  // HTML → 画像レンダリング
+  // HTML→画像
   const card = await context.newPage();
   await card.setContent(html, { waitUntil: 'load' });
   await card.screenshot({ path: 'leaderboard_card.png', fullPage: true });
 
   await browser.close();
-  console.log('✅ Done: leaderboard_card.png / raw_page.png / data/last.json / debug/json/*');
+  console.log('✅ Done: leaderboard_card.png / raw_page.png / debug/page.html / debug/json/* / data/last.json');
 })();
