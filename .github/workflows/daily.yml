@@ -2,35 +2,36 @@ name: FlashTrade Leaderboard Snapshot
 
 on:
   schedule:
-    - cron: "0 6 * * *"   # 06:00 UTC = 15:00 JST（時間は後で変更OK）
-  workflow_dispatch: {}    # 手動実行ボタンを有効にする
+    # 毎日 07:00 UTC（= 日本時間 16:00）
+    - cron: "0 7 * * *"
+  workflow_dispatch:
 
 jobs:
   snapshot:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Node.js (set npm registry explicitly)
+      - name: Setup Node.js (pin registry)
         uses: actions/setup-node@v4
         with:
           node-version: '20'
-          registry-url: 'https://registry.npmjs.org'  # ← これで npm の registry を固定
+          registry-url: 'https://registry.npmjs.org'
 
-      - name: Install dependencies
+      - name: Install Playwright (no native deps)
         run: |
-          npm install playwright canvas
-
-      - name: Install Playwright browsers
-        run: |
+          npm ci || npm install
           npx playwright install --with-deps chromium
 
       - name: Generate leaderboard image
-        run: node snapshot.js
+        run: |
+          node snapshot.js
 
       - name: Upload snapshot
         uses: actions/upload-artifact@v4
         with:
           name: leaderboard-snapshot
           path: leaderboard_snapshot.png
+
