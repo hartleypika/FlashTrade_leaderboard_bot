@@ -2,7 +2,7 @@ name: FlashTrade Leaderboard Snapshot
 
 on:
   schedule:
-    - cron: '0 6 * * *'   # 15:00 JST
+    - cron: "0 6 * * *" # JST15:00 (UTC+0 06:00)
   workflow_dispatch:
 
 jobs:
@@ -10,38 +10,43 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
+      # Node.js セットアップ
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '20'
 
-      # ← 追加：npm レジストリを明示（ETARGET 回避）
-      - name: Pin npm registry (optional but safer)
+      # npm registry を明示してミラー問題を回避
+      - name: Pin npm registry
         run: |
           npm config set registry https://registry.npmjs.org/
           npm config set fund false
           npm config set audit false
 
-      # ← 追加：playwright を依存として入れる
-      - name: Install Node deps (playwright)
+      # Playwright とブラウザの両方をインストール
+      - name: Install dependencies
         run: |
           npm init -y
           npm install --no-audit --no-fund playwright@^1.48.0
 
-      # ← ブラウザ本体を入れる
       - name: Install Playwright browsers
         run: npx playwright install --with-deps chromium
 
+      # snapshot.js を実行
       - name: Generate leaderboard image
         run: node snapshot.js
 
+      # 出力物を保存（画像とJSON）
       - name: Upload snapshot
         uses: actions/upload-artifact@v4
         with:
-          name: leaderboard-snapshot
+          name: leaderboard_snapshot
           path: |
             leaderboard_snapshot.png
+            leaderboard_rows.json
             debug_page.html
             debug_page.png
+            debug_info.txt
