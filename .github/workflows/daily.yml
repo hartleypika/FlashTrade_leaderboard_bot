@@ -21,6 +21,10 @@ jobs:
         run: |
           npm install playwright canvas
 
+      - name: Install Playwright browsers
+        run: |
+          npx playwright install --with-deps chromium
+
       - name: Generate leaderboard image
         run: node snapshot.js
 
