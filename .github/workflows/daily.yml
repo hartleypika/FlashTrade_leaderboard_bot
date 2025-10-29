@@ -1,27 +1,24 @@
+# .github/workflows/daily.yml
 name: FlashTrade Leaderboard Snapshot
 
 on:
   schedule:
-    - cron: "0 7 * * *"  # 07:00 UTC = 16:00 JST
-  workflow_dispatch:
+    - cron: '0 6 * * *'   # 毎日 06:00 UTC = 15:00 JST
+  workflow_dispatch:       # 手動実行も残す
 
 jobs:
   snapshot:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Node.js (pin registry)
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '20'
-          registry-url: 'https://registry.npmjs.org'
 
       - name: Install Playwright (no native deps)
-        run: |
-          npm ci || npm install
-          npx playwright install --with-deps chromium
+        run: npx playwright install --with-deps chromium
 
       - name: Generate leaderboard image
         run: node snapshot.js
@@ -30,4 +27,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: leaderboard-snapshot
-          path: leaderboard_snapshot.png
+          path: |
+            leaderboard_snapshot.png
+            debug_page.html
+            debug_page.png
