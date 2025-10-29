@@ -2,40 +2,27 @@ name: FlashTrade Leaderboard Snapshot
 
 on:
   schedule:
-    - cron: "0 6 * * *"  # 毎日15:00 JST（=06:00 UTC）
-  workflow_dispatch:
+    - cron: "0 6 * * *"   # 06:00 UTC = 15:00 JST（時間は後で変更OK）
+  workflow_dispatch: {}    # 手動実行ボタンを有効にする
 
 jobs:
   snapshot:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Node.js
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 20
 
       - name: Install dependencies
         run: |
-          npm install playwright
-          npx playwright install --with-deps chromium
+          npm install playwright canvas
 
-      - name: Capture leaderboard screenshot
-        run: |
-          node <<'EOF'
-          const { chromium } = require('playwright');
-          (async () => {
-            const browser = await chromium.launch();
-            const page = await browser.newPage({ viewport: { width: 1600, height: 1200 } });
-            await page.goto('https://www.flash.trade/leaderboard', { waitUntil: 'networkidle' });
-            await page.waitForTimeout(8000);
-            await page.screenshot({ path: 'leaderboard_snapshot.png', fullPage: true });
-            await browser.close();
-          })();
-          EOF
+      - name: Generate leaderboard image
+        run: node snapshot.js
 
       - name: Upload snapshot
         uses: actions/upload-artifact@v4
