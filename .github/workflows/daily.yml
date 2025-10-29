@@ -2,8 +2,11 @@ name: FlashTrade Leaderboard Snapshot
 
 on:
   schedule:
-    - cron: "0 6 * * *" # JST15:00 (UTC+0 06:00)
+    - cron: "0 6 * * *"   # 15:00 JST
   workflow_dispatch:
+
+permissions:
+  contents: write   # ← data/last.json をコミットするため
 
 jobs:
   snapshot:
@@ -12,22 +15,21 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      # Node.js セットアップ
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '20'
 
-      # npm registry を明示してミラー問題を回避
       - name: Pin npm registry
         run: |
           npm config set registry https://registry.npmjs.org/
           npm config set fund false
           npm config set audit false
 
-      # Playwright とブラウザの両方をインストール
-      - name: Install dependencies
+      - name: Install dependencies (Playwright)
         run: |
           npm init -y
           npm install --no-audit --no-fund playwright@^1.48.0
@@ -35,18 +37,24 @@ jobs:
       - name: Install Playwright browsers
         run: npx playwright install --with-deps chromium
 
-      # snapshot.js を実行
-      - name: Generate leaderboard image
+      - name: Generate card image
         run: node snapshot.js
 
-      # 出力物を保存（画像とJSON）
-      - name: Upload snapshot
+      # data/last.json をコミット（次回の前日比較に使う）
+      - name: Commit daily data
+        run: |
+          if [ -n "$(git status --porcelain data/last.json)" ]; then
+            git config user.name  "gh-actions"
+            git config user.email "actions@github.com"
+            git add data/last.json
+            git commit -m "chore: update daily snapshot data"
+            git push
+          fi
+
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: leaderboard_snapshot
+          name: leaderboard_card
           path: |
-            leaderboard_snapshot.png
+            leaderboard_card.png
             leaderboard_rows.json
-            debug_page.html
-            debug_page.png
-            debug_info.txt
