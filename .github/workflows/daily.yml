@@ -2,7 +2,7 @@ name: FlashTrade Leaderboard Snapshot
 
 on:
   schedule:
-    # 日本時間15:00 = UTC 06:00
+    # 日本時間 15:00 = UTC 06:00
     - cron: '0 6 * * *'
   workflow_dispatch:
 
@@ -19,7 +19,14 @@ jobs:
         with:
           node-version: 20
 
-      - name: Install Playwright (browser)
+      # ★ 重要：Playwright 本体を入れる（これが無いと require('playwright') で落ちます）
+      - name: Install Playwright package
+        run: |
+          npm config set registry https://registry.npmjs.org/
+          npm install --no-save playwright@1.48.2
+
+      # ★ ブラウザ本体も入れる（--with-deps で必要ライブラリも）
+      - name: Install Playwright browsers
         run: npx playwright install --with-deps chromium
 
       - name: Generate card image
