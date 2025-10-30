@@ -1,47 +1,36 @@
-name: FlashTrade leaderboard (OCR)
+name: FlashTrade Leaderboard Snapshot
 
 on:
-  workflow_dispatch: {}
   schedule:
-    # 15:00 JST (= 06:00 UTC)
-    - cron: "0 6 * * *"
+    - cron: "0 6 * * *"  # 15:00 JST = 06:00 UTC
+  workflow_dispatch: {}
 
 jobs:
-  run:
+  snapshot:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-
     steps:
-      - name: Checkout
+      - name: Checkout repo
         uses: actions/checkout@v4
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: '20'
 
-      - name: Install Tesseract OCR
+      - name: Install dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y tesseract-ocr tesseract-ocr-eng
+          npm ci || npm i
+          npx playwright install --with-deps
 
-      - name: Install deps (Playwright only)
-        run: |
-          npm i playwright@^1.48.2
-
-      - name: Install Playwright browsers
-        run: npx playwright install --with-deps
-
-      - name: Generate leaderboard (screenshot → OCR → parse → card)
+      - name: Generate card image
         run: node snapshot.js
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: leaderboard-artifacts
+          name: leaderboard-assets
           path: |
-            leaderboard_card.png
             raw_page.png
-            ocr.txt
-            debug/**
-            data/**
+            leaderboard_card.png
+            data/last_ocr.txt
+            data/last_rows.json
