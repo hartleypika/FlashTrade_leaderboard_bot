@@ -1,4 +1,4 @@
-// snapshot.js  — Full page-text → 強化パーサ → 画像生成（スクショも保存）
+// snapshot.js — Full page-text → 改良パーサ → 画像生成（スクショも保存）
 const fs = require('fs/promises');
 const path = require('path');
 const { chromium } = require('playwright');
@@ -7,76 +7,78 @@ const URL = 'https://www.flash.trade/leaderboard';
 
 // ========= ヘルパ =========
 const medal = (r) => (r === 1 ? '🥇 ' : r === 2 ? '🥈 ' : r === 3 ? '🥉 ' : '');
-const timeStampUTC = () => new Date().toISOString().slice(0,16).replace('T',' ');
-const toNum = (s) => Number(String(s||'').replace(/[^\d.]/g,'')) || 0;
-const fmtUSD = (n) => '$' + Math.round(Math.max(0, Number(n||0))).toLocaleString('en-US');
-
-function fixed(str, max){ str=String(str??''); return str.length<=max?str:str.slice(0,max-1)+'…'; }
+const timeStampUTC = () => new Date().toISOString().slice(0, 16).replace('T', ' ');
+const toNum = (s) => Number(String(s || '').replace(/[^\d.]/g, '')) || 0;
+const fmtUSD = (n) => '$' + Math.round(Math.max(0, Number(n || 0))).toLocaleString('en-US');
+const fixed = (str, max) => {
+  str = String(str ?? '');
+  return str.length <= max ? str : str.slice(0, max - 1) + '…';
+};
 
 // ========= 改良版「超しつこい」行抽出ロジック =========
 function parseOCR(ocrText) {
-  const lines = ocrText.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+  const lines = ocrText.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
   const rows = [];
 
-  for (const lineRaw of lines) {
-    const line = lineRaw.replace(/\s{2,}/g,' ');
+  for (const raw of lines) {
+    const line = raw.replace(/\s{2,}/g, ' ');
 
-    // <01> ～ <20> を拾う（空白許容）
+    // <01> ～ <20>
     const rM = line.match(/<\s*0?([1-9]|1\d|20)\s*>/);
     if (!rM) continue;
     const rank = Number(rM[1]);
 
-    // アドレス … を含む（…/.../…混在吸収）
+    // アドレス（…/…/… 省略表現含む）
     const aM = line.match(/[A-Za-z0-9]{2,}\s?(?:\.{3,}|…)\s?[A-Za-z0-9]{2,}/);
     if (!aM) continue;
-    const address = aM[0].replace(/\s+/g,'');
+    const address = aM[0].replace(/\s+/g, '');
 
     // LVL
     const lM = line.match(/LVL\s?\d+/i);
-    const level = lM ? lM[0].replace(/\s+/g,'').toUpperCase() : '';
+    const level = lM ? lM[0].replace(/\s+/g, '').toUpperCase() : '';
 
-    // FAF（“FAF staked”の直前のカンマ数字）
-    const fM = line.match(/([\d,]{1,3}(?:,\d{3})+)\s*FAF/i);
-    const faf = fM ? fM[1] : '';
+    // FAF（数字 + "FAF" のゆるい検出）
+    const fM = line.match(/([\d,.\s]{3,})\s*FAF/i);
+    const faf = fM ? fM[1].replace(/[^\d,]/g, '') : '';
 
-    // VP = 行の最後の “大きい数字” （FAFと被ったら一つ前）
-    const all = [...line.matchAll(/[\d,]{1,3}(?:,\d{3})+/g)].map(m=>m[0]);
-    let vp = '';
-    if (all.length) {
-      vp = all[all.length-1];
-      if (faf && vp === faf && all.length >= 2) vp = all[all.length-2];
+    // VP: 行中の “カンマ区切りの大きい数値” の最後
+    const nums = [...line.matchAll(/[\d,]{1,3}(?:,\d{3})+/g)].map((m) => m[0]);
+    let vpText = '';
+    if (nums.length) {
+      vpText = nums[nums.length - 1];
+      if (faf && vpText === faf && nums.length >= 2) vpText = nums[nums.length - 2];
     }
+    const vpNum = toNum(vpText);
 
-    rows.push({ rank, address, level, faf, vp, vpNum: toNum(vp) });
+    rows.push({ rank, address, level, faf, vpText, vpNum });
   }
 
-  // rank優先でソート（同rankはVP大きい順）
-  rows.sort((a,b)=> a.rank-b.rank || b.vpNum-a.vpNum);
+  rows.sort((a, b) => a.rank - b.rank || b.vpNum - a.vpNum);
 
-  // 1～20に欠番があれば穴埋め
+  // 1～20の穴埋め
   const top = [];
-  for (let r=1; r<=20; r++){
-    const hit = rows.find(x=>x.rank===r);
-    top.push(hit || { rank:r, address:'', level:'', faf:'', vp:'—', vpNum:0 });
+  for (let r = 1; r <= 20; r++) {
+    const hit = rows.find((x) => x.rank === r);
+    top.push(hit || { rank: r, address: '', level: '', faf: '', vpText: '', vpNum: 0 });
   }
   return top;
 }
 
-// ヘッダー“Epoch #7 Volume Traded $xxx”を拾う（なければ合計VP）
-function parseHeaderTotal(ocrText, rows){
+// ヘッダー “Epoch #x Volume Traded $xxx” → なければ Top20 合計
+function parseHeaderTotal(ocrText, rows) {
   const m = ocrText.match(/Epoch\s*#?\s*\d+\s*Volume\s*Traded\s*\$([\d,\.]+)/i);
   if (m) return fmtUSD(toNum(m[1]));
-  const sum = rows.reduce((a,b)=>a+b.vpNum,0);
+  const sum = rows.reduce((a, b) => a + (b.vpNum || 0), 0);
   return fmtUSD(sum);
 }
 
 // ========= メイン =========
-(async () => {
+;(async () => {
   await fs.mkdir('data', { recursive: true });
 
   const browser = await chromium.launch({
     headless: true,
-    args: ['--no-sandbox','--disable-dev-shm-usage','--disable-blink-features=AutomationControlled']
+    args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-blink-features=AutomationControlled'],
   });
 
   const ctx = await browser.newContext({
@@ -88,49 +90,57 @@ function parseHeaderTotal(ocrText, rows){
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
   });
 
-  // bot回避の軽い偽装
   await ctx.addInitScript(() => {
-    Object.defineProperty(navigator,'webdriver',{get:()=>false});
-    Object.defineProperty(navigator,'languages',{get:()=>['en-US','en']});
-    Object.defineProperty(navigator,'platform',{get:()=> 'Win32'});
+    Object.defineProperty(navigator, 'webdriver', { get: () => false });
+    Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+    Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
   });
 
   const page = await ctx.newPage();
 
-  // 高信頼でロード（リトライ＋スクロール）
-  for (let i=1;i<=3;i++){
+  // ロードをしつこく待つ
+  for (let i = 1; i <= 3; i++) {
     await page.goto(`${URL}?_=${Date.now()}_${i}`, { waitUntil: 'domcontentloaded', timeout: 60000 });
-    try { await page.waitForLoadState('networkidle', { timeout: 15000 }); } catch {}
-    for (let k=0;k<6;k++){ await page.mouse.wheel(0,800); await page.waitForTimeout(400); }
-    const ok = await page.evaluate(() => /[A-Za-z0-9]{2,}\.{3,}[A-Za-z0-9]{2,}/.test(document.body.innerText));
+    try {
+      await page.waitForLoadState('networkidle', { timeout: 15000 });
+    } catch {}
+    for (let k = 0; k < 6; k++) {
+      await page.mouse.wheel(0, 800);
+      await page.waitForTimeout(400);
+    }
+    const ok = await page
+      .evaluate(() => /[A-Za-z0-9]{2,}\.{3,}[A-Za-z0-9]{2,}/.test(document.body.innerText))
+      .catch(() => false);
     if (ok) break;
     await page.waitForTimeout(1200);
   }
 
-  // エビデンス用：フルスクショ
+  // 証跡スクショ
   await page.screenshot({ path: 'raw_page.png', fullPage: true });
 
   // 全選択テキスト
   const ocrText = await page.evaluate(() => document.body.innerText);
-  await fs.writeFile(path.join('data','last_ocr.txt'), ocrText, 'utf8');
+  await fs.writeFile(path.join('data', 'last_ocr.txt'), ocrText, 'utf8');
 
-  // 抽出
+  // 解析
   const rows = parseOCR(ocrText);
   const totalStr = parseHeaderTotal(ocrText, rows);
+  await fs.writeFile(path.join('data', 'last_rows.json'), JSON.stringify(rows, null, 2), 'utf8');
 
-  // 保存（JSON）
-  await fs.writeFile(path.join('data','last_rows.json'), JSON.stringify(rows, null, 2), 'utf8');
-
-  // 画像用HTML（重なり防止の固定幅）
-  const rowsHtml = rows.map(r => `
-    <tr>
-      <td>${medal(r.rank)}${String(r.rank).padStart(2,'0')}</td>
-      <td title="${r.address}">${fixed(r.address, 46)}</td>
-      <td>${r.level}</td>
-      <td>${r.faf || '—'}</td>
-      <td style="text-align:right">${r.vp ? '$'+Number(r.vp.replace(/,/g,'')).toLocaleString('en-US') : '—'}</td>
-    </tr>
-  `).join('');
+  // ===== 画像用 HTML（ここで vpNum を直接使用して NaN を根絶）=====
+  const rowsHtml = rows
+    .map((r) => {
+      const vpCell = r.vpNum > 0 ? fmtUSD(r.vpNum) : '—';
+      return `
+      <tr>
+        <td>${medal(r.rank)}${String(r.rank).padStart(2, '0')}</td>
+        <td title="${r.address}">${fixed(r.address, 46)}</td>
+        <td>${r.level || ''}</td>
+        <td>${r.faf || '—'}</td>
+        <td style="text-align:right">${vpCell}</td>
+      </tr>`;
+    })
+    .join('');
 
   const html = `<!doctype html><html><head><meta charset="utf-8">
   <style>
