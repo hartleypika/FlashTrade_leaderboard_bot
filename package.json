@@ -1,8 +1,8 @@
 {
-  "name": "flashtrade-leaderboard-bot",
+  "name": "flashtrade-ocr",
   "private": true,
   "type": "commonjs",
-  "devDependencies": {
-    "playwright": "^1.48.0"
+  "dependencies": {
+    "playwright": "^1.48.2"
   }
 }
