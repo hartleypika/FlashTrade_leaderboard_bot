@@ -1,7 +1,10 @@
 {
-  "name": "flashtrade-ocr",
-  "private": true,
+  "name": "flash-leaderboard-bot",
+  "version": "1.0.0",
   "type": "commonjs",
+  "scripts": {
+    "start": "node snapshot.js"
+  },
   "dependencies": {
     "playwright": "^1.48.2"
   }
